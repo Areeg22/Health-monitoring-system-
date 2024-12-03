@@ -1,0 +1,224 @@
+#include "HX711.h"
+#include <Wire.h>
+#include <MPU6050.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+#define USE_WIRELESS 1
+//#define USE_GSM 1
+#define USE_MPU 1
+#define USE_LOAD 1
+
+
+// Wi-Fi credentials
+const char* ssid = "POTATO_MACHINE 3761";
+const char* password = "184(97Ad";
+
+// MQTT broker details
+const char* mqtt_server = "test.mosquitto.org";  // Replace with your broker's address
+const int mqtt_port = 1883;                    // Port (default is 1883)
+const char* mqtt_topic = "2024/CAP/Darin";         // Topic to publish JSON data
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Pins
+const int LOADCELL_DOUT_PIN = 5;
+const int LOADCELL_SCK_PIN = 4;
+const int flexPin = 33;
+const int waterPin = 32;
+class GSM
+{
+  private :
+  public:
+    GSM() {
+    }
+    void begin()
+    {
+      Serial2.begin(9600);
+    }
+    void updateSerial()
+    {
+      delay(500);
+      while (Serial2.available())
+      {
+        Serial.write(Serial2.read());//Forward what Software Serial received to Serial Port
+      }
+    }
+    void Test()
+    { Serial2.println("AT");
+      updateSerial();
+      Serial.println();
+      Serial2.println("AT+CSQ");
+      updateSerial();
+      Serial2.println("AT+CCID");
+      updateSerial();
+      Serial2.println("AT+CREG?");
+      updateSerial();
+      Serial2.println("ATI");
+      updateSerial();
+      Serial2.println("AT+CBC");
+      updateSerial();
+    }
+    void MSG(String Number, String text)
+    {
+      Serial2.println("AT+CMGF=1"); // Configuring TEXT mode
+      updateSerial();
+      Serial2.println("AT+CMGS=\"+2" + Number + "\""); //change ZZ with country code and xxxxxxxxxxx with phone number to sms
+      updateSerial();
+      Serial2.print(text); //text content
+      updateSerial();
+      Serial2.write(26);
+    }
+};
+
+// Sensors
+HX711 scale;
+MPU6050 mpu;
+GSM gsm;
+// Calibration values
+float calibration_factor = -90;
+const double threshold = 0.1;     // Threshold in g's for detecting a zero-crossing
+const unsigned long sampleInterval = 5;   // Sampling interval for 200 Hz (5 ms)
+const unsigned long timeWindow = 1000;    // Time window for counting zero-crossings (1 second)
+const unsigned long sendingInterval = 10000;
+unsigned long lastSentTime = 0;
+
+// For storing sensor values
+float load , flex, vibration, water;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(flexPin, INPUT);
+  pinMode(waterPin, INPUT);
+#ifdef USE_WIRELESS
+  // Connect to Wi-Fi
+  connectWiFi();
+
+  // Set up MQTT client
+  client.setServer(mqtt_server, mqtt_port);
+  connectMQTT();
+#endif
+#ifdef USE_GSM
+  gsm.begin();
+  gsm.Test();
+#endif
+  Serial.println("Initializing Load Sensor");
+
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(calibration_factor);
+#ifdef USE_MPU
+  Wire.begin();
+  mpu.initialize();  // Initialize the MPU6050
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 connected successfully.");
+  } else {
+    Serial.println("MPU6050 connection failed.");
+    while (1);  // Stop if sensor is not connected
+  }
+#endif
+  lastSentTime = millis();
+  Serial.println("Starting");
+}
+double calculateFrequency();
+void loop() {
+#ifdef USE_LOAD
+  load = scale.get_units();
+#endif
+  flex = analogRead(flexPin);
+  water = analogRead(waterPin);
+  water = float(map(water, 0, 4095, 0, 400)) / 100.0;
+#ifdef USE_MPU
+  vibration = calculateFrequency();
+#endif
+  if (millis() - lastSentTime >= sendingInterval) {
+    lastSentTime = millis();
+#ifdef USE_WIRELESS
+
+    // Create JSON payload
+    String jsonPayload = "{\"load\": " + String(load) + ", \"def\": " + String(flex) + ", \"acc\": " + String(vibration) + ",\"water\": " + String(water) + "}";
+    if (client.publish(mqtt_topic, jsonPayload.c_str())) {
+      Serial.println("JSON data sent to MQTT broker:");
+      Serial.println(jsonPayload);
+    } else {
+      Serial.println("Failed to send JSON data.");
+    }
+#else
+    Serial.print(load);
+    Serial.print(",");
+    Serial.print(flex);
+    Serial.print(",");
+    Serial.print(vibration);
+    Serial.print(",");
+    Serial.println(water);
+#endif
+#ifdef USE_GSM
+    if (load > 50000)
+      gsm.MSG("01061985162", "High Value");
+#endif
+  }
+#ifdef USE_WIRELESS
+  if (!client.connected()) {
+    connectMQTT();
+  }
+  client.loop();
+#endif
+}
+
+double calculateFrequency() {
+  unsigned long startTime = millis();
+  unsigned long sampleTime = millis();
+  int zeroCrossings = 0;
+  bool aboveThreshold = false;
+
+  while (millis() - startTime < timeWindow) {
+    // Wait for the next sample time
+    unsigned long currentTime = millis();
+    if (currentTime - sampleTime >= sampleInterval) {
+      sampleTime = currentTime;
+      // Read Z-axis acceleration data
+      int16_t ax, ay, az;
+      mpu.getAcceleration(&ax, &ay, &az);
+
+      // Convert raw data to "g" units
+      double accelZ = az / 16384.0;
+
+      // Zero-crossing detection
+      if (aboveThreshold && accelZ < -threshold) {
+        aboveThreshold = false;
+        zeroCrossings++;
+      } else if (!aboveThreshold && accelZ > threshold) {
+        aboveThreshold = true;
+        zeroCrossings++;
+      }
+    }
+  }
+
+  // Calculate frequency: each zero-crossing pair is one full wave
+  double frequency = zeroCrossings / 2.0;
+  return frequency;  // Return the calculated frequency after 1 second
+}
+void connectWiFi() {
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to Wi-Fi");
+}
+
+void connectMQTT() {
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT broker...");
+    if (client.connect("Darin_STEM_2024")) {  // Client ID for MQTT
+      Serial.println("Connected to MQTT broker");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" Retry in 5 seconds...");
+      delay(5000);
+    }
+  }
+}
